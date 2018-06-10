@@ -1,7 +1,6 @@
 package main
 
 // #include "bfdd.h"
-// #cgo CFLAGS: -I ./
 // #cgo LDFLAGS: -L ./ -lbfdd
 //void callOnMeGo_cgo(BFD_RSP *val);
 //void logCallOnMeGo_cgo(char *val);
@@ -41,6 +40,9 @@ type Manager struct {
 
 	//BFD会话状态
 	BFDSessionState map[string]string
+
+	//BFD服务类型， 如果是HA bfd则为真，如果是业务BFD则为假
+	BFDServiceType map[string]bool
 }
 
 const (
@@ -134,6 +136,8 @@ func bfdLogCallback(info *C.char) {
 	log.Debug(C.GoString(info))
 }
 
+//通知上层回调函数
+
 //export bfdCallback
 func bfdCallback(val *C.BFD_RSP) {
 	Msg := nrpc.BFDSessionMsg{}
@@ -153,10 +157,12 @@ func bfdCallback(val *C.BFD_RSP) {
 		Msg.MsgType = BFDSessionDelete
 	}
 
+	//会话key值
 	Msg.MsgKey = cchararray2gostring(val.msgkey[:])
 
 	//更新BFD会话表状态
 	BfdMng.Lock()
+	Msg.MsgServiceType = BfdMng.BFDServiceType[Msg.MsgKey]
 	BfdMng.BFDSessionState[Msg.MsgKey] = Msg.MsgType
 	BfdMng.Unlock()
 
@@ -199,6 +205,9 @@ func (BfdMng *Manager) BFDConfigDispatch() {
 			//设置会话初始状态
 			BfdMng.BFDSessionState[Key] = BFDSessionDown
 
+			//设置服务类型，HA为true或者业务为false
+			BfdMng.BFDServiceType[Key] = Value.BfdServiceType
+
 			//复制一份到旧的会话表
 			BfdMng.OldBFDSession[Key] = Value
 
@@ -215,10 +224,17 @@ func (BfdMng *Manager) BFDConfigDispatch() {
 				//删除会话
 				BfdDeleteSession(Value)
 
+				//删除会话状态
+				delete(BfdMng.BFDSessionState, Key)
+
+				//删除服务类型
+				delete(BfdMng.BFDServiceType, Key)
+
 				//发布会话删除事件
 				Msg := nrpc.BFDSessionMsg{}
 				Msg.MsgType = BFDSessionDelete
 				Msg.MsgKey = Key
+				Msg.MsgServiceType = Value.BfdServiceType
 
 				//编码BFD消息
 				data, err := json.Marshal(&Msg)
@@ -229,10 +245,6 @@ func (BfdMng *Manager) BFDConfigDispatch() {
 
 				// 发布RPC信息
 				BfdMng.RPC.Publish(system.SetMasterPrefix("BFD.Event.StateInfo"), data)
-
-				//删除会话状态
-				log.Info("BFD delete session, Key: %s", Key)
-				delete(BfdMng.BFDSessionState, Key)
 			}
 		}
 		//遍历新会话表，找出旧会话表不存在的表项并新建会话
@@ -240,11 +252,14 @@ func (BfdMng *Manager) BFDConfigDispatch() {
 			if _, ok := BfdMng.OldBFDSession[Key]; ok {
 				//存在不处理
 			} else {
-				//不存在则新建会话并添加到旧的会话表中
+				//初始化会话状态
 				BfdMng.BFDSessionState[Key] = BFDSessionDown
 
 				//复制一份到旧的会话表
 				BfdMng.OldBFDSession[Key] = Value
+
+				//设置服务类型，HA或者业务
+				BfdMng.BFDServiceType[Key] = Value.BfdServiceType
 
 				//新建会话
 				log.Info("BFD add session, Key: %s", Key)
@@ -260,6 +275,7 @@ func BfdCfgRefreshCallBack() {
 	defer BfdMng.Unlock()
 
 	//BFD进程启动，则配置BFD会话
+	log.Info("BFD Config Refresh")
 	BfdMng.BFDConfigDispatch()
 }
 
@@ -278,12 +294,12 @@ func BfdHBProc() {
 
 				data, err := json.Marshal(BfdHBMsg)
 				if nil != err {
-					log.Err("SendHeartBeat, json.Marshal  fail! err:%s.",
+					log.Err("BFD SendHeartBeat, json.Marshal  fail! err:%s.",
 						err.Error())
 					return
 				}
 
-				log.Debug("SendHeartBeat, Publish  ServiceHeartBeat OK. Service:%s.================", BfdHBMsg.ServiceName)
+				log.Debug("BFD SendHeartBeat, Publish  ServiceHeartBeat OK. Service:%s.================", BfdHBMsg.ServiceName)
 				// 发布bfdd心跳
 				BfdMng.RPC.Publish(system.SetMasterPrefix("Ha.Event.ServiceHeartBeat"), data)
 				BfdTimeHdl.Reset(time.Duration(2) * time.Second)
@@ -297,19 +313,19 @@ func BfdMngInit() error {
 	BfdMng = &Manager{}
 
 	//初始化rpc池
-	log.Info("bfd init rpc")
+	log.Info("BFD Init RPC")
 	system.GetMasterPrefix()
 	rpcurl := system.GetLocalBoardRpcUrl(system.GetLocalBoardId())
 	err := nrpc.Init(rpcurl, 50, 10*time.Second)
 	if nil != err {
-		log.Err("Init bfd rpc pool fail")
+		log.Err("****Init BFD RPC Pool fail****")
 		return err
 	}
 
 	//创建订阅连接RPC
 	rpc, err := nrpc.NewRpc()
 	if nil != err {
-		log.Err("BFD NewRpc fail:%s", err.Error())
+		log.Err("****BFD NewRpc fail:%s****", err.Error())
 		return err
 	}
 
@@ -325,6 +341,9 @@ func BfdMngInit() error {
 
 	//会话状态控制块初始化
 	BfdMng.BFDSessionState = make(map[string]string)
+
+	//会话服务类型初始化
+	BfdMng.BFDServiceType = make(map[string]bool)
 
 	return nil
 }
@@ -353,6 +372,8 @@ func BfdAddSession(BfdSessionkey string, BFDCfgData nrpc.BFDSessionCfg) {
 	cVal.desMinTx = C.uint(BFDCfgData.DesiredMinTx)
 	cVal.reqMinRx = C.uint(BFDCfgData.RequiredMinRx)
 	cVal.reqMinEchoRx = C.uint(BFDCfgData.RequiredEchoMinRx)
+	//cVal.serviceType = C.uchar(BFDCfgData.BfdServiceType)
+
 	gostring2cbyte(cVal.key[:], BfdSessionkey)
 
 	C.bfd_add(&cVal)
@@ -361,8 +382,8 @@ func BfdAddSession(BfdSessionkey string, BFDCfgData nrpc.BFDSessionCfg) {
 func main() {
 	//配置log 日志
 	level := flag.Int("l", 7, "log level[-1:disble,0:emerg,1:alert,2:crit,3:err,4:warning,5:notice,6:info,7:debug,8:trace],default:-1")
-	console := flag.Bool("c", true, "log out to console")
-	syncLog := flag.Bool("s", true, " synchronize process log")
+	console := flag.Bool("c", false, "log out to console")
+	syncLog := flag.Bool("s", false, "synchronize process log")
 
 	flag.Parse()
 
@@ -381,7 +402,7 @@ func main() {
 	//初始化BFD管理器
 	err := BfdMngInit()
 	if nil != err {
-		log.Err("BFD mng init fail! err:%s.", err.Error())
+		log.Err("****************BFD mng init fail! err:%s.", err.Error())
 		return
 	}
 
@@ -393,14 +414,14 @@ func main() {
 	//bfd初始化
 	ret := C.bfd_init()
 	if ret != 0 {
-		log.Info("BFD init fail")
+		log.Info("*************BFD init fail")
 		return
 	}
 
 	//读取BFD配置文件信息并注册配置文件刷新回调函数
 	ConfigErr := config.InitBfdCfg(BfdCfgRefreshCallBack)
 	if nil != ConfigErr {
-		log.Err("InitBfdCfg fail:%s", ConfigErr.Error())
+		log.Err("*************InitBfdCfg fail:%s", ConfigErr.Error())
 	} else {
 		log.Info("InitBfdCfg success.")
 	}
@@ -418,6 +439,7 @@ func main() {
 			Msg := nrpc.BFDSessionMsg{}
 			Msg.MsgType = Value
 			Msg.MsgKey = Key
+			Msg.MsgServiceType = BfdMng.BFDServiceType[Key]
 
 			//编码BFD消息
 			data, err := json.Marshal(&Msg)
@@ -446,10 +468,10 @@ func main() {
 	case syscall.SIGSEGV, syscall.SIGABRT:
 		recordPainc(nil)
 	default:
-		log.Info("BFD Receive signal %s\n", sig.String())
+		log.Info("*************BFD Receive signal %s\n", sig.String())
 	}
 	C.bfd_exit()
-	log.Info("BFD Recive signal %s, program exit", sig.String())
+	log.Info("*************BFD Recive signal %s, program exit", sig.String())
 
 	time.After(1 * time.Second)
 }

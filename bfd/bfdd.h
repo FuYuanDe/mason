@@ -17,17 +17,10 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <time.h>
+#include <unistd.h>
 
-
-
-#define log_info(fmt, arg...)   \
-    if(bfd_debug_enable) \
-    printf("[bfd] %s:%d "fmt,__FUNCTION__,__LINE__,##arg)
-
-#define log_debug(fmt, arg...)  \
-   if(bfd_debug_enable) \
-    printf("[bfd] %s:%d "fmt,__FUNCTION__,__LINE__,##arg)
 
 /* 
    The Mandatory Section of a BFD Control packet has the following
@@ -164,10 +157,7 @@ struct session {
 
     int del_flag;       //删除标志
     
-    
-	char	 key[56];		            // key 值    
-	unsigned int try_pkts;              // 尝试连接次数
-    
+	char	 key[56];		            // key 值        
 };
 
 /* bfd fsm event */
@@ -181,7 +171,6 @@ struct session {
 
 
 #define BFD_SESSION_HASH_SIZE      255
-#define BFD_LISTENING_PORT 3784
 #define BFD_MSG_BUFFER_SIZE 512
 
 struct bfd_master
@@ -229,17 +218,17 @@ struct msg_node{
 
 // BFD消息类型
 enum MSGTYPE {
-	BFDSessionUp   = 0,	    // 会话up
-	BFDSessionDown   = 1,	// 会话down
-	BFDSessionDelete   = 2,	// 会话delete	
+	BFDSessionUp       = 0,	//会话up
+	BFDSessionDown     = 1,	//会话down
+	BFDSessionDelete   = 2,	//会话delete	
 };
 
 
 // BFD响应消息
 typedef struct {
-	char msgkey[56];
-	char msginfo[100];
-	int msgtype;
+	char msgkey[56];    //消息key值
+	char msginfo[100];  //消息原因
+	int msgtype;        //消息类型
 	
 }BFD_RSP;
 
@@ -258,8 +247,8 @@ typedef struct
 	uint32_t desMinTx;		// 最小发送时间
 	uint32_t reqMinRx;		// 最小接收时间
 	uint32_t reqMinEchoRx;	// echo 报文接收时间
-	
 	char	 key[56];		// key 值    
+	
 } BFD_CFG;
 
 // 定义回调函数
@@ -277,13 +266,14 @@ void bfd_log(char *msg, int size, const char *fmt, ...);
 void bfd_notify(char *msgkey, char *msginfo, int msgtype);
 struct session *bfd_session_lookup(uint32_t my_disc, struct sockaddr_in *dst, struct sockaddr_in * src);
 
-void bfd_stop_xmit_timer(struct session *bfd_session);
-void bfd_start_xmit_timer(struct session *bfd_session);
-void bfd_stop_expire_timer(struct session *bfd_session);
-void bfd_change_interval_time(struct session *bfd_session, unsigned int tx, unsigned int rx);
+void bfd_stop_tx_timer(struct session *bfd_session);
+void bfd_start_tx_timer(struct session *bfd_session);
+void bfd_stop_rx_timer(struct session *bfd_session);
 
 void *bfd_session_work(void *data);
 void *bfd_epoll_work(void *data);
+
+int bfd_fsm_ignore(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
 
 int bfd_fsm_admindown_rcvd_start(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
 int bfd_fsm_admindown_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
@@ -312,10 +302,6 @@ int bfd_fsm_up_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int r
 int bfd_fsm_up_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
 int bfd_fsm_up_rcvd_time_expire(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
 int bfd_fsm_up_rcvd_admindown(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len);
-
-
-
-
 
 
 #endif
