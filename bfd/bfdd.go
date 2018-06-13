@@ -45,6 +45,45 @@ type Manager struct {
 	BFDServiceType map[string]bool
 }
 
+//BFD状态查询响应
+type GetBfdInfoResp struct {
+	Key           string `json:"key"`
+	LocalIP       string `json:"localip"`
+	LocalPort     uint16 `json:"localport"`
+	RemoteIP      string `json:"remoteip"`
+	RemotePort    uint16 `json:"remoteport"`
+	State         string `json:"state"`
+	DetectMult    uint32 `json:"detectmult"`
+	DesiredMinTx  uint32 `json:"desiredmintx"`
+	RequiredMinRx uint32 `json:"requiredminrx"`
+}
+
+type GetBfdInfoArrResp struct {
+	InfoArray []*GetBfdInfoResp `json:"infoarray"`
+}
+
+type GetBoardInfoResp struct {
+	State        string `json:"state"`
+	Slot         int    `json:"slot"`
+	BoardType    string `json:"boardtype"`
+	SwVersion    string `json:"swversion"`
+	HwVersion    string `json:"hwversion"`
+	MaxChns      int    `json:"maxchns"`
+	MaxSub       int    `json:"maxsub"`
+	PortMin      int    `json:"portmin"`
+	PortMax      int    `json:"portmax"`
+	RegCounts    int    `json:"regcounts"`
+	Timeouts     int    `json:"timeouts"`
+	MaxHeartbeat int    `json:"maxheartbeat"`
+	HeartTime    int    `json:"hearttime"`
+	CurrHeart    int    `json:"currheart"`
+	CurrChns     int    `json:"currchns"`
+}
+
+type GetBoardInfoArrResp struct {
+	InfoArray []*GetBoardInfoResp `json:"infoarray"`
+}
+
 const (
 	//BFD会话up消息
 	BFDSessionUp string = "BFDSessionUp"
@@ -175,7 +214,7 @@ func bfdCallback(val *C.BFD_RSP) {
 	}
 
 	// 发布RPC信息
-	log.Info("BFD Publish Event %s", Msg.MsgType)
+	log.Warning("BFD Publish Event %s, key: %s, info: %s", Msg.MsgType, Msg.MsgKey, Msg.MsgInfo)
 	BfdMng.RPC.Publish(system.SetMasterPrefix("BFD.Event.StateInfo"), data)
 }
 
@@ -381,7 +420,7 @@ func BfdAddSession(BfdSessionkey string, BFDCfgData nrpc.BFDSessionCfg) {
 
 func main() {
 	//配置log 日志
-	level := flag.Int("l", 7, "log level[-1:disble,0:emerg,1:alert,2:crit,3:err,4:warning,5:notice,6:info,7:debug,8:trace],default:-1")
+	level := flag.Int("l", 4, "log level[-1:disble,0:emerg,1:alert,2:crit,3:err,4:warning,5:notice,6:info,7:debug,8:trace],default:-1")
 	console := flag.Bool("c", false, "log out to console")
 	syncLog := flag.Bool("s", false, "synchronize process log")
 
@@ -399,15 +438,30 @@ func main() {
 		logger.SetFlag(log.LSyncOut)
 	}
 
+	system.GetMasterPrefix()
+	rpcurl := system.GetLocalBoardRpcUrl(system.GetLocalBoardId())
+	err := nrpc.Init(rpcurl, 50, 10*time.Second)
+	if nil != err {
+		log.Err("****Init BFD RPC Pool fail****")
+		return
+	}
+
+	//创建订阅连接RPC
+	Rpc, err := nrpc.NewRpc()
+	if nil != err {
+		log.Err("****BFD NewRpc fail:%s****", err.Error())
+		return
+	}
+
 	//初始化BFD管理器
-	err := BfdMngInit()
+	err = BfdMngInit()
 	if nil != err {
 		log.Err("****************BFD mng init fail! err:%s.", err.Error())
 		return
 	}
 
 	//设置库回调函数
-	log.Debug("BFD init, set callback")
+	log.Debug("BFD Init, set callback")
 	C.bfd_setCallback((C.CALLBACK_FUNC)(unsafe.Pointer(C.callOnMeGo_cgo)))
 	C.bfd_setLogCallback((C.LOG_CALLBACK_FUNC)(unsafe.Pointer(C.logCallOnMeGo_cgo)))
 
@@ -430,10 +484,12 @@ func main() {
 	//测试的时候先关闭
 	//BfdHBProc()
 
-	// 订阅BFD查询消息
-	BfdMng.RPC.Subscribe(system.SetMasterPrefix("BFD.Event.GetInfo"), func(msg *nats.Msg) {
+	//订阅BFD查询消息
+	Rpc.Subscribe(system.SetMasterPrefix("BFD.Event.GetInfo"), func(msg *nats.Msg) {
 
 		BfdMng.Lock()
+		defer BfdMng.Unlock()
+
 		//查询状态表
 		for Key, Value := range BfdMng.BFDSessionState {
 			Msg := nrpc.BFDSessionMsg{}
@@ -449,9 +505,31 @@ func main() {
 			}
 
 			// 发布RPC信息
-			BfdMng.RPC.Publish(system.SetMasterPrefix("BFD.Event.StateInfo"), data)
+			Rpc.Publish(system.SetMasterPrefix("BFD.Event.StateInfo"), data)
 		}
-		BfdMng.Unlock()
+
+		//命令行打印
+		resp := &GetBfdInfoArrResp{}
+		for key, value := range BfdMng.BFDSession {
+			array := GetBfdInfoResp{}
+			array.State = BfdMng.BFDSessionState[key]
+			array.LocalIP = value.LocalIP
+			array.LocalPort = value.LocalPort
+			array.RemoteIP = value.RemoteIP
+			array.RemotePort = value.RemotePort
+			array.Key = key
+			array.DetectMult = value.DetectMult
+			array.DesiredMinTx = value.DesiredMinTx
+			array.RequiredMinRx = value.RequiredMinRx
+
+			resp.InfoArray = append(resp.InfoArray, &array)
+		}
+		data, err := json.Marshal(resp)
+		if nil != err {
+			BfdMng.RPC.Publish(msg.Reply, []byte("Error:Get data fail"))
+			return
+		}
+		Rpc.Publish(msg.Reply, data)
 	})
 
 	chSignal := make(chan os.Signal, 5)
@@ -460,7 +538,7 @@ func main() {
 	signal.Notify(chSignal, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT,
 		syscall.SIGSEGV, syscall.SIGABRT)
 
-	log.Info("All BFD init finished, start run BFD")
+	log.Info("BFD Init finished, start run BFD v1")
 
 	//阻塞直至有信号传入
 	sig := <-chSignal
@@ -470,8 +548,8 @@ func main() {
 	default:
 		log.Info("*************BFD Receive signal %s\n", sig.String())
 	}
-	C.bfd_exit()
 	log.Info("*************BFD Recive signal %s, program exit", sig.String())
+	C.bfd_exit()
 
 	time.After(1 * time.Second)
 }

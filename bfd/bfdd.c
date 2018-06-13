@@ -6,16 +6,12 @@ LOG_CALLBACK_FUNC log_callback;     // 日志输出函数指针
 struct bfd_master master;   // 会话控制块
 static pthread_mutex_t bfd_session_lock = PTHREAD_MUTEX_INITIALIZER;    //会话控制块保护锁
 
-static int bfd_debug_enable = 1;    
-
 int efd;    // epoll文件描述符，    
 struct epoll_event g_event;  // epoll事件
 struct epoll_event *g_events; 
 pthread_t epoll_thread;                      //epoll监听线程
 
-char msg_buf[BFD_MSG_BUFFER_SIZE] = {0};    // 主线程消息缓存
-char rx_thread_buf[BFD_MSG_BUFFER_SIZE] = {0};  // 接受线程消息缓存
-char timer_thread_buf[BFD_MSG_BUFFER_SIZE] = {0}; // 定时器处理线程消息缓存
+char msg_buf[BFD_MSG_BUFFER_SIZE] = {0};     //消息缓存
 
 
 //获取hash   key
@@ -173,25 +169,13 @@ struct session *bfd_session_new(struct session_cfg *session_cfg) {
             free(bfd_session);
             return NULL;
         }
-
         bfd_session->rx_timer.fd_type = MSG_EVENT_RX_TIMER;
         bfd_session->rx_timer.bfd_session = bfd_session;
-                        
-        
-        // 添加到epoll池中
-        #if 0
-        g_event.data.ptr = &(bfd_session->tx_timer); 
-        g_event.events = EPOLLIN;
-        epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->tx_timer.fd, &g_event);          
-      
-        g_event.data.ptr = &(bfd_session->rx_timer); 
-        g_event.events = EPOLLIN;       
-        epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->rx_timer.fd, &g_event);          
 
-        g_event.data.ptr = &(bfd_session->sockfd); 
-        g_event.events = EPOLLIN;
-        epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->sockfd.fd, &g_event);          
-        #endif
+        //初始化锁和条件变量                               
+        pthread_mutex_init(&bfd_session->bfd_mutex, NULL); 
+        pthread_cond_init(&bfd_session->bfd_cond, NULL);
+
 
         //创建消息节点并发送初始会话消息
         msg = calloc(1, sizeof(struct msg_node));
@@ -214,14 +198,15 @@ struct session *bfd_session_new(struct session_cfg *session_cfg) {
                     }                
                 }
             }   
-            //bfd_log(msg_buf, sizeof(msg_buf), "%s:%d session add msg ",__FUNCTION__, __LINE__);
+            bfd_log(msg_buf, sizeof(msg_buf), "%s:%d session add msg ",__FUNCTION__, __LINE__);
 
             pthread_mutex_unlock(&(bfd_session->bfd_mutex));         
         
             //通知消费者线程
             pthread_cond_signal(&(bfd_session->bfd_cond));  
         }
-    
+
+        //添加到epoll池中
         ep_event.data.ptr = &(bfd_session->tx_timer); 
         ep_event.events = EPOLLIN;
         epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->tx_timer.fd, &ep_event);          
@@ -229,14 +214,10 @@ struct session *bfd_session_new(struct session_cfg *session_cfg) {
         ep_event.data.ptr = &(bfd_session->rx_timer); 
         ep_event.events = EPOLLIN;       
         epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->rx_timer.fd, &ep_event);          
-
         ep_event.data.ptr = &(bfd_session->sockfd); 
-        ep_event.events = EPOLLIN;
-        err = epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->sockfd.fd, &ep_event);         
-        
-        pthread_mutex_init(&bfd_session->bfd_mutex, NULL); 
-        pthread_cond_init(&bfd_session->bfd_cond, NULL);
-        
+        ep_event.events = EPOLLIN | EPOLLET;
+        //ep_event.events = EPOLLIN;
+        err = epoll_ctl(efd, EPOLL_CTL_ADD, bfd_session->sockfd.fd, &ep_event);                         
 	}
 	else {	
 	    //bfd_log(&msg_buf[0], 512, " %s:%d session malloc failed ",__FUNCTION__,__LINE__);
@@ -278,7 +259,7 @@ int bfd_session_add(struct session_cfg *cfg) {
     //创建新的会话 
 	bfd_session = bfd_session_new(cfg);
 	if(!bfd_session) {
-        bfd_log(&msg_buf[0], 512, "%s:%d create session fail. ",__FUNCTION__,__LINE__);
+        //bfd_log(&msg_buf[0], 512, "%s:%d create session fail. ",__FUNCTION__,__LINE__);
 		return -1;
     }
     bfd_log(&msg_buf[0], 512, "%s:%d create new session success. ",__FUNCTION__,__LINE__);
@@ -298,45 +279,43 @@ int bfd_session_add(struct session_cfg *cfg) {
 
 
     //创建工作线程
-
     ret = pthread_create(&bfd_session->bfd_work_thread, NULL, bfd_session_work, (void *)bfd_session);
     if (ret != 0 ) {
         bfd_log(&msg_buf[0], sizeof(msg_buf), "%s:%d thread create fail ",__FUNCTION__, __LINE__);   
 
-          //从会话链表中移除
-          pthread_mutex_lock(&bfd_session_lock); 
-          key = hash_key(bfd_session->bfdh.my_disc, 0);
-          session_cur = master.session_tbl[key];
-          
-          while(session_cur && session_cur->bfdh.my_disc != bfd_session->bfdh.my_disc) {
-              session_priv = session_cur;
-              session_cur = session_cur->session_next;
-          }
-          
-          if (session_priv == NULL)
-              master.session_tbl[key] = bfd_session->session_next;
-          else 
-              session_priv->session_next = bfd_session->session_next; 
-          
-          key = hash_key(0, bfd_session->raddr.sin_addr.s_addr);
-          neigh_cur = master.neigh_tbl[key];
-          while(neigh_cur && neigh_cur->bfdh.my_disc != bfd_session->bfdh.my_disc) {
-              neigh_priv = neigh_cur;
-              neigh_cur = neigh_cur->neigh_next;
-          }
-          if (neigh_priv == NULL)
-              master.neigh_tbl[key] = bfd_session->session_next;
-          else 
-              neigh_priv->neigh_next = bfd_session->session_next;    
-          pthread_mutex_unlock(&bfd_session_lock);    
+        //从会话链表中移除
+        pthread_mutex_lock(&bfd_session_lock); 
+        key = hash_key(bfd_session->bfdh.my_disc, 0);
+        session_cur = master.session_tbl[key];
+        
+        while(session_cur && session_cur->bfdh.my_disc != bfd_session->bfdh.my_disc) {
+            session_priv = session_cur;
+            session_cur = session_cur->session_next;
+        }
+        
+        if (session_priv == NULL)
+            master.session_tbl[key] = session_cur->session_next;
+        else 
+            session_priv->session_next = session_cur->session_next; 
+        
+        key = hash_key(0, bfd_session->raddr.sin_addr.s_addr);
+        neigh_cur = master.neigh_tbl[key];
+        while(neigh_cur && neigh_cur->bfdh.my_disc != bfd_session->bfdh.my_disc) {
+            neigh_priv = neigh_cur;
+            neigh_cur = neigh_cur->neigh_next;
+        }
+        if (neigh_priv == NULL)
+            master.neigh_tbl[key] = neigh_cur->neigh_next;
+        else 
+            neigh_priv->neigh_next = neigh_cur->neigh_next;    
+            
+        pthread_mutex_unlock(&bfd_session_lock);    
 
         //从epoll队列中移除
         epoll_ctl(efd, EPOLL_CTL_DEL, bfd_session->rx_timer.fd, NULL);      
         epoll_ctl(efd, EPOLL_CTL_DEL, bfd_session->tx_timer.fd, NULL);      
         epoll_ctl(efd, EPOLL_CTL_DEL, bfd_session->sockfd.fd, NULL);      
-        
-
-        
+                
         //关闭文件描述符
         close(bfd_session->rx_timer.fd);
         close(bfd_session->tx_timer.fd);
@@ -363,16 +342,13 @@ int bfd_session_add(struct session_cfg *cfg) {
 	return err;
 }
 
-
-
-// 发送报文
-int bfd_send_packet(struct session *bfd_session)
-{
+//发送报文
+int bfd_send_packet(struct session *bfd_session){
 	int ret = 0;
 	int addr_len;
     struct sockaddr_in dst;
 	char buffer[sizeof(struct bfdhdr)] = {0};
-    
+
     addr_len = sizeof(struct sockaddr_in);
     memcpy(&dst, &bfd_session->raddr, addr_len);
 	memcpy(buffer, &(bfd_session->bfdh), sizeof(struct bfdhdr));
@@ -380,15 +356,14 @@ int bfd_send_packet(struct session *bfd_session)
     ret = sendto(bfd_session->sockfd.fd, &buffer, sizeof(struct bfdhdr), 0, (struct sockaddr *)&dst, addr_len);
     
     if (ret == -1)
-        bfd_log(&timer_thread_buf[0], 512, " %s:%d bfd send ctrl len :%d , errno :%d ",__FUNCTION__,__LINE__, ret, errno);
+        bfd_log(&msg_buf[0], 512, " %s:%d bfd send ctrl len :%d , errno :%d ",__FUNCTION__,__LINE__, ret, errno);
 
 	return ret;
 }
 
 
-/* 设置发送定时器 */
-void bfd_start_tx_timer(struct session *bfd_session)
-{
+//开启发送定时器 
+void bfd_start_tx_timer(struct session *bfd_session) {
     int ret;
     time_t t;
 	unsigned int jitter;
@@ -406,7 +381,7 @@ void bfd_start_tx_timer(struct session *bfd_session)
     timeval.it_interval.tv_nsec = timeval.it_value.tv_nsec;
 
     ret = timerfd_settime(bfd_session->tx_timer.fd, 0, &timeval, NULL);    // 相对时间
-//        bfd_log(&msg_buf[0], 512, " %s:%d set tx timer",__FUNCTION__,__LINE__);
+        
     if (ret == -1) {
         bfd_log(&msg_buf[0], 512, " %s:%d settimer fail，errno : %d",__FUNCTION__,__LINE__, errno);
     }
@@ -415,7 +390,7 @@ void bfd_start_tx_timer(struct session *bfd_session)
 }
 
 
-// 取消发送定时器
+//取消发送定时器
 void bfd_stop_tx_timer(struct session *bfd_session) {
     int ret;
     struct itimerspec timeval;  
@@ -448,16 +423,16 @@ void bfd_stop_rx_timer(struct session *bfd_session) {
 }
 
 
-// 重置超时定时器
+//重置超时定时器
 void bfd_reset_rx_timer(struct session *bfd_session) {
     int ret;
     struct itimerspec timeval;  
     memset(&timeval, 0, sizeof(struct itimerspec));       
 
-    // 停止超时检测定时器
+    //停止超时检测定时器
     bfd_stop_rx_timer(bfd_session);
    
-    // 设置定时
+    //设置定时
     timeval.it_value.tv_sec = (bfd_session->detect_time)/1000000;
  	timeval.it_value.tv_nsec = (((uint64_t)bfd_session->detect_time)*1000)%1000000000;  
  	timeval.it_interval.tv_sec = timeval.it_value.tv_sec;
@@ -498,68 +473,44 @@ struct
 } FSM[BFD_STA_MAX][BFD_EVENT_MAX]
 ={
 	{
-        // admindown
-		{bfd_fsm_ignore, BFD_STA_ADMINDOWN},				// Start 
-		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				// Received_Down 
-		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				// Received_Init 
-		{bfd_fsm_ignore,    BFD_STA_ADMINDOWN},				// Received_Up 
-		{bfd_fsm_ignore, BFD_STA_ADMINDOWN},				// TimerExpired
-		{bfd_fsm_ignore,   BFD_STA_ADMINDOWN},	    // Received_AdminDown 
+        //admindown
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				//Start 
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				//Received_Down 
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				//Received_Init 
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				//Received_Up 
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},				//TimerExpired
+		{bfd_fsm_ignore,  BFD_STA_ADMINDOWN},	            //Received_AdminDown 
 	},
 	{
-		// down
-		{bfd_fsm_down_rcvd_start, BFD_STA_DOWN},						// Start，
-		{bfd_fsm_down_rcvd_down,  BFD_STA_INIT},					// Received_Down 
-		{bfd_fsm_down_rcvd_init,  BFD_STA_UP},					// Received_Init 
-		{bfd_fsm_ignore,    BFD_STA_DOWN},						// Received_Up 
-		{bfd_fsm_ignore, BFD_STA_DOWN},						// TimerExpired 
-		{bfd_fsm_ignore, BFD_STA_DOWN},		    // Received_AdminDown 
+		//down
+		{bfd_fsm_down_rcvd_start, BFD_STA_DOWN},			//Start，
+		{bfd_fsm_down_rcvd_down,  BFD_STA_INIT},			//Received_Down 
+		{bfd_fsm_down_rcvd_init,  BFD_STA_UP},				//Received_Init 
+		{bfd_fsm_ignore,          BFD_STA_DOWN},			//Received_Up 
+		{bfd_fsm_ignore,          BFD_STA_DOWN},			//TimerExpired 
+		{bfd_fsm_ignore,          BFD_STA_DOWN},		    //Received_AdminDown 
 	},
 	{
-		// init
-		{bfd_fsm_ignore, BFD_STA_INIT},						// Start 
-		{bfd_fsm_init_rcvd_down, BFD_STA_INIT},						// Received_Down 
-		{bfd_fsm_init_rcvd_init, BFD_STA_UP},					// Received_Init 
-		{bfd_fsm_init_rcvd_up, BFD_STA_UP},						// Received_Up 
-		{bfd_fsm_init_rcvd_time_expire, BFD_STA_DOWN},				// TimerExpired 
-		{bfd_fsm_init_rcvd_admindown, BFD_STA_DOWN},		    // Received_AdminDown 
+		//init
+		{bfd_fsm_ignore,            BFD_STA_INIT},			//Start 
+		{bfd_fsm_init_rcvd_down,    BFD_STA_INIT},			//Received_Down 
+		{bfd_fsm_init_rcvd_init,    BFD_STA_UP},			//Received_Init 
+		{bfd_fsm_init_rcvd_up,      BFD_STA_UP},			//Received_Up 
+		{bfd_fsm_init_rcvd_time_expire, BFD_STA_DOWN},		//TimerExpired 
+		{bfd_fsm_init_rcvd_admindown,   BFD_STA_DOWN},      //Received_AdminDown 
 	},
 	{
-		// Up
-		{bfd_fsm_ignore, BFD_STA_UP},						// Start 
-		{bfd_fsm_up_rcvd_down, BFD_STA_DOWN},					// Received_Down 
-		{bfd_fsm_up_rcvd_init, BFD_STA_UP},						// Received_Init 
-		{bfd_fsm_up_rcvd_up, BFD_STA_UP},						// Received_Up 
-		{bfd_fsm_up_rcvd_time_expire, BFD_STA_DOWN},				// TimerExpired 
-		{bfd_fsm_up_rcvd_admindown, BFD_STA_DOWN},		    // Received_AdminDown 
+		//Up
+		{bfd_fsm_ignore,        BFD_STA_UP},				//Start 
+		{bfd_fsm_up_rcvd_down,  BFD_STA_DOWN},				//Received_Down 
+		{bfd_fsm_up_rcvd_init,  BFD_STA_UP},				//Received_Init 
+		{bfd_fsm_up_rcvd_up,    BFD_STA_UP},				//Received_Up 
+		{bfd_fsm_up_rcvd_time_expire, BFD_STA_DOWN},		//TimerExpired 
+		{bfd_fsm_up_rcvd_admindown,   BFD_STA_DOWN},		//Received_AdminDown 
 	},
 };
 
 int bfd_fsm_ignore(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_start(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_time_expire(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
-    return 0;
-}
-
-int bfd_fsm_admindown_rcvd_admindown(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
     return 0;
 }
 
@@ -609,8 +560,7 @@ int bfd_fsm_down_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int
         bfd_session->bfdh.poll = old_poll_bit;       
     }
 
-
-    //down 
+    //!Up状态发送默认时间配置
     bfd_session->bfdh.des_min_tx_intv = htonl(BFD_DEFAULT_TX_INTERVAL);
     bfd_session->bfdh.req_min_rx_intv = htonl(BFD_DEFAULT_TX_INTERVAL);    
     
@@ -635,6 +585,7 @@ int bfd_fsm_down_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int
 int bfd_fsm_down_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len) {
     int old_poll_bit;
     int old_state;
+    int flag = 0;
     
     if(bfd_session->bfdh.my_disc != bfdh->your_disc)
         return -1;
@@ -681,10 +632,12 @@ int bfd_fsm_down_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
     if(bfd_session->bfdh.des_min_tx_intv != htonl(bfd_session->des_min_tx_time)){
         bfd_session->bfdh.poll = 1;
         bfd_log(&msg_buf[0], 512, "%s %d BFD  Start Poll Sequence . ",__FUNCTION__,__LINE__);
+        flag = 1;
     }
     if(bfd_session->bfdh.req_min_rx_intv != htonl(bfd_session->req_min_rx_time)){
         bfd_session->bfdh.poll = 1;              
-        bfd_log(&msg_buf[0], 512, "%s %d BFD  Start Poll Sequence . ",__FUNCTION__,__LINE__);
+        if(!flag)
+            bfd_log(&msg_buf[0], 512, "%s %d BFD  Start Poll Sequence . ",__FUNCTION__,__LINE__);
     }
 
     if(bfd_session->des_min_tx_time < ntohl(bfd_session->bfdh.des_min_tx_intv)) {
@@ -697,18 +650,16 @@ int bfd_fsm_down_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
             bfd_reset_tx_timer(bfd_session); 
         }
     }
-
-    //
+    
     if(bfd_session->req_min_rx_time > ntohl(bfd_session->bfdh.req_min_rx_intv)){
         bfd_session->act_rx_intv = 
             bfd_session->req_min_rx_time < ntohl(bfdh->des_min_tx_intv) ?
             ntohl(bfdh->des_min_tx_intv) : bfd_session->req_min_rx_time;
     }
 
+    //Up状态下发送配置时间
     bfd_session->bfdh.des_min_tx_intv = htonl(bfd_session->des_min_tx_time);
-    bfd_session->bfdh.req_min_rx_intv = htonl(bfd_session->req_min_rx_time);
-    
-    //bfd_session->bfdh.diag = BFD_DIAG_NO_DIAG;
+    bfd_session->bfdh.req_min_rx_intv = htonl(bfd_session->req_min_rx_time);    
     
     if(bfdh->poll) {
         old_poll_bit = bfd_session->bfdh.poll;
@@ -722,6 +673,7 @@ int bfd_fsm_down_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
 
     bfd_reset_rx_timer(bfd_session);
     bfd_notify(bfd_session->key, "", BFDSessionUp);        
+
     return 0;
 }
 
@@ -774,7 +726,7 @@ int bfd_fsm_init_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int
 int bfd_fsm_init_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
     int old_state;
     int old_poll_bit;
-    
+    int flag = 0;    
     if(bfd_session->bfdh.my_disc != bfdh->your_disc)
         return -1;
 
@@ -817,13 +769,15 @@ int bfd_fsm_init_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
     }        
     
     if(bfd_session->des_min_tx_time != ntohl(bfd_session->bfdh.des_min_tx_intv)){
-        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
         bfd_session->bfdh.poll = 1;
+        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
+        flag = 1;
     }
     
     if(bfd_session->req_min_rx_time != ntohl(bfd_session->bfdh.req_min_rx_intv)){
-        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
         bfd_session->bfdh.poll = 1;
+        if(!flag)
+            bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
     }
     
     if(bfd_session->des_min_tx_time < ntohl(bfd_session->bfdh.des_min_tx_intv)) {
@@ -844,6 +798,7 @@ int bfd_fsm_init_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
         bfd_session->detect_time = bfdh->detect_mult * bfd_session->act_rx_intv;              
     }
 
+    //Up状态下发送配置时间
 	bfd_session->bfdh.des_min_tx_intv = htonl(bfd_session->des_min_tx_time);
 	bfd_session->bfdh.req_min_rx_intv = htonl(bfd_session->req_min_rx_time);
 
@@ -859,12 +814,14 @@ int bfd_fsm_init_rcvd_init(struct session *bfd_session, struct bfdhdr *bfdh, int
     //重置超时定时器
     bfd_reset_rx_timer(bfd_session);
     bfd_notify(bfd_session->key, "", BFDSessionUp);
-    return ;
+
+    return 0;
 }
 
 int bfd_fsm_init_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
     int old_state;
     int old_poll_bit;
+    int flag = 0;
     
     if(bfd_session->bfdh.my_disc != bfdh->your_disc)
         return -1;
@@ -910,13 +867,15 @@ int bfd_fsm_init_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int r
 
 
     if(bfd_session->des_min_tx_time != ntohl(bfd_session->bfdh.des_min_tx_intv)){
-        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
         bfd_session->bfdh.poll = 1;
+        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
+        flag = 1;
     }
     
     if(bfd_session->req_min_rx_time != ntohl(bfd_session->bfdh.req_min_rx_intv)){
-        bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
         bfd_session->bfdh.poll = 1;
+        if(!flag)
+            bfd_log(&msg_buf[0], 512, "%s %d BFD Poll Sequence Start. ",__FUNCTION__,__LINE__);
     }
     
     if(bfd_session->des_min_tx_time < ntohl(bfd_session->bfdh.des_min_tx_intv)) {
@@ -936,7 +895,8 @@ int bfd_fsm_init_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int r
             ntohl(bfdh->des_min_tx_intv) : bfd_session->req_min_rx_time;
         bfd_session->detect_time = bfdh->detect_mult * bfd_session->act_rx_intv;              
     }
-    
+
+    //Up状态下发送配置时间    
     bfd_session->bfdh.des_min_tx_intv = htonl(bfd_session->des_min_tx_time);
     bfd_session->bfdh.req_min_rx_intv = htonl(bfd_session->req_min_rx_time);
     
@@ -952,6 +912,7 @@ int bfd_fsm_init_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int r
     //reset_rx_timer
     bfd_reset_rx_timer(bfd_session);
     bfd_notify(bfd_session->key, "", BFDSessionUp);
+    
     return 0;
 }
 
@@ -1019,6 +980,7 @@ int bfd_fsm_init_rcvd_admindown(struct session *bfd_session, struct bfdhdr *bfdh
 int bfd_fsm_up_rcvd_start(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
     return 0;
 }
+
 
 int bfd_fsm_up_rcvd_down(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
     int old_state;
@@ -1152,7 +1114,7 @@ int bfd_fsm_up_rcvd_up(struct session *bfd_session, struct bfdhdr *bfdh, int rec
 
     bfd_reset_rx_timer(bfd_session);
     
-    return ;
+    return 0;
 }
 
 int bfd_fsm_up_rcvd_time_expire(struct session *bfd_session, struct bfdhdr *bfdh, int recv_len){
@@ -1262,6 +1224,7 @@ struct session *bfd_session_lookup(uint32_t my_disc, struct sockaddr_in *dst, st
 	if (my_disc){
 		key = hash_key(my_disc, 0);
 		if (key == -1) {
+            pthread_mutex_unlock(&bfd_session_lock);		
             return NULL;
 		}
 		bfd_session = master.session_tbl[key];
@@ -1274,6 +1237,7 @@ struct session *bfd_session_lookup(uint32_t my_disc, struct sockaddr_in *dst, st
 	else {
 		key = hash_key(0, dst->sin_addr.s_addr);
 		if (key == -1) {
+            pthread_mutex_unlock(&bfd_session_lock);		
             return NULL;
 		}
 		bfd_session = master.neigh_tbl[key];
@@ -1287,9 +1251,11 @@ struct session *bfd_session_lookup(uint32_t my_disc, struct sockaddr_in *dst, st
 	}
     pthread_mutex_unlock(&bfd_session_lock);
 
+    #if 0
 	if (bfd_session == NULL && dst != 0)
         bfd_log(&msg_buf[0], 512, "%s %d addr not match, dst : %u:%u:%u:%u, raddr : %u:%u:%u:%u",__FUNCTION__,__LINE__, NIPQUAD(dst->sin_addr.s_addr),NIPQUAD(src->sin_addr.s_addr));             
-
+    #endif
+    
 	return bfd_session;
 }
 
@@ -1302,12 +1268,12 @@ int bfd_check_packet_validity(struct session *bfd_session, char *data, int recv_
 
     //检查长度
     if(bfdh->len > recv_len) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d length is too short. Discarded. bfdh->len :%d > recv_len :%d",__FUNCTION__,__LINE__, bfdh->len, len);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d length is too short. Discarded. bfdh->len :%d > recv_len :%d",__FUNCTION__,__LINE__, bfdh->len, len);
         return -1;
     }
     
     if((!bfdh->auth && bfdh->len != BFD_CTRL_LEN) || (bfdh->auth && bfdh->len < BFD_CTRL_AUTH_LEN)) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d bfd packet length (%d) not right. Discarded ",__FUNCTION__,__LINE__, bfdh->len);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d bfd packet length (%d) not right. Discarded ",__FUNCTION__,__LINE__, bfdh->len);
         return -1;
     }
 
@@ -1320,13 +1286,13 @@ int bfd_check_packet_validity(struct session *bfd_session, char *data, int recv_
     
     //判断版本号是否正确
     if(bfdh->version != BFD_VERSION) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d bfd packet wrong version : %u ",__FUNCTION__,__LINE__, bfdh->version);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d bfd packet wrong version : %u ",__FUNCTION__,__LINE__, bfdh->version);
         return -1;
     }
 
     //如果认证字段置位，discarded
     if(bfdh->auth) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d Auth type is set. Discarded",__FUNCTION__,__LINE__);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d Auth type is set. Discarded",__FUNCTION__,__LINE__);
         return -1;
     }
 
@@ -1342,25 +1308,25 @@ int bfd_check_packet_validity(struct session *bfd_session, char *data, int recv_
     
     //检查detect_mult是否合法
     if(bfdh->detect_mult == 0) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d Detect Multi field is zero. Discarded ",__FUNCTION__,__LINE__);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d Detect Multi field is zero. Discarded ",__FUNCTION__,__LINE__);
         return -1;
     }
 
     //检查 my_disc是否合法
     if(bfdh->my_disc == 0) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d My Discriminator field is zero. Discarded ",__FUNCTION__,__LINE__);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d My Discriminator field is zero. Discarded ",__FUNCTION__,__LINE__);
         return -1;
     }
 
     //检测echo字段是否合法        
     if (bfdh->req_min_echo_rx_intv != 0) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d echo_rx_intv not zero, Discarded, peer_req_echo_rx_intv : %x ",__FUNCTION__,__LINE__, bfdh->req_min_echo_rx_intv);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d echo_rx_intv not zero, Discarded, peer_req_echo_rx_intv : %x ",__FUNCTION__,__LINE__, bfdh->req_min_echo_rx_intv);
         return -1;
     }
 
     //查询模式，discarded
     if(bfdh->demand) {
-        //bfd_log(&rx_thread_buf[0], 512, "[BFD] %s %d receive demand mode set, discarded ",__FUNCTION__,__LINE__);
+        //bfd_log(&msg_buf[0], 512, "[BFD] %s %d receive demand mode set, discarded ",__FUNCTION__,__LINE__);
         return -1;
     }
 
@@ -1375,9 +1341,11 @@ int bfd_check_packet_validity(struct session *bfd_session, char *data, int recv_
 
 //bfd会话线程 
 void *bfd_session_work(void *data) {
-    int err = 0;
     int ret;
+    int err = 0;
     int is_quit = 0;
+    int test = 0;
+    
     char buffer[BUFF_SIZE] = {0};
     char msg_buffer[BFD_MSG_BUFFER_SIZE] = {0};    
     struct bfdhdr *bfdh = NULL;
@@ -1392,38 +1360,30 @@ void *bfd_session_work(void *data) {
 
     
     //循环监听消息队列
-    while(!is_quit) {
-
+    while(!is_quit) {  
         pthread_mutex_lock(&bfd_session->bfd_mutex);
         
         while(bfd_session->msg_head == NULL)   
             pthread_cond_wait(&bfd_session->bfd_cond, &bfd_session->bfd_mutex);            
 
         msg = bfd_session->msg_head;
-        bfd_session->msg_head = bfd_session->msg_head->next;
-//        bfd_session->msg_head = msg->next;
+        bfd_session->msg_head = bfd_session->msg_head->next;        
 
         pthread_mutex_unlock(&bfd_session->bfd_mutex);                    
 
-        //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d working now",__FUNCTION__, __LINE__);
         switch (msg->msg_type){
             //超时发送事件
             case MSG_EVENT_TX_TIMER:
-            
-                /*
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d send msg",__FUNCTION__, __LINE__);
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d send msg success",__FUNCTION__, __LINE__);
-                */
+                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d tx timer",__FUNCTION__, __LINE__);
+
                 bfd_send_packet(bfd_session);
                 bfd_start_tx_timer(bfd_session);
+
                 break;
 
             //超时接收事件    
             case MSG_EVENT_RX_TIMER:
-                /*
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d rx msg",__FUNCTION__, __LINE__);
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d rx msg success",__FUNCTION__, __LINE__);
-                */
+                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d rx timer",__FUNCTION__, __LINE__);            
                 bfd_fsm_event(bfd_session, BFD_EVENT_TIMER_EXPIRE, NULL, 0);
 
                 break;
@@ -1431,18 +1391,17 @@ void *bfd_session_work(void *data) {
             //报文读取接收事件
             case MSG_EVENT_SOCKET:
                 err = 0;
-                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d receive msg",__FUNCTION__, __LINE__);                                                
-                //recv_len = recvfrom(bfd_session->sockfd.fd, buffer, BUFF_SIZE, 0, (struct sockaddr *)&src, &addr_len);                
-                recv_len = recvfrom(bfd_session->sockfd.fd, buffer, BUFF_SIZE, MSG_DONTWAIT, (struct sockaddr *)&src, &addr_len);
+                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d receive socket",__FUNCTION__, __LINE__);                                                
+                //recv_len = recvfrom(bfd_session->sockfd.fd, buffer, BUFF_SIZE, MSG_DONTWAIT, (struct sockaddr *)&src, &addr_len);
+                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d receive, recv_len : %d, errno: %d",__FUNCTION__, __LINE__, recv_len, errno);                
+                recv_len = recvfrom(bfd_session->sockfd.fd, buffer, BUFF_SIZE, 0, (struct sockaddr *)&src, &addr_len);
                 
-                if(recv_len >= BFD_CTRL_LEN) {
-                
+                if(recv_len >= BFD_CTRL_LEN) {                
                     err = bfd_check_packet_validity(bfd_session, buffer, recv_len, &src);
 
                     //状态机处理
                     if(!err) {
                         bfdh = (struct bfdhdr *)buffer;
-                        //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d recv packet",__FUNCTION__, __LINE__);
                         switch(bfdh->sta){                            
                             case BFD_STA_ADMINDOWN:
 
@@ -1450,34 +1409,33 @@ void *bfd_session_work(void *data) {
                                 break;
                         
                             case BFD_STA_DOWN:
-                                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d recv down",__FUNCTION__, __LINE__);
 
                                 bfd_fsm_event(bfd_session, BFD_EVENT_RECV_DOWN, bfdh, recv_len);
                                 break;
                         
                             case BFD_STA_INIT:
-                                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d recv init",__FUNCTION__, __LINE__);
                                 bfd_fsm_event(bfd_session, BFD_EVENT_RECV_INIT, bfdh, recv_len);
                         
                                 break;
                         
                             case BFD_STA_UP:
-                                //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d recv admin",__FUNCTION__, __LINE__);
                                 bfd_fsm_event(bfd_session, BFD_EVENT_RECV_UP, bfdh, recv_len);
+
                                 break;
                         
                             default:
                                 break;                            
                         }
-                        //bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d receive msg success",__FUNCTION__, __LINE__);                    
                     }
                 }
+
                 break;
 
             //删除事件    
             case MSG_EVENT_DELETE:
                 //发送admindown报文
                 bfd_session->bfdh.sta = BFD_STA_ADMINDOWN;
+                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d send admindown",__FUNCTION__, __LINE__);                
                 bfd_send_packet(bfd_session);
                 
                 //从epoll队列中删除
@@ -1509,17 +1467,14 @@ void *bfd_session_work(void *data) {
 
             //初始事件
             case MSG_EVENT_START:
-                /*
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d bfd session start event",__FUNCTION__, __LINE__);             
-                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d bfd session start event success",__FUNCTION__, __LINE__); 
-                */
+                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d start event",__FUNCTION__, __LINE__);            
                 bfd_fsm_event(bfd_session, BFD_EVENT_START, NULL, 0);    
 
                 break;
 
             default:
+                bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d unrecognized event",__FUNCTION__, __LINE__);                        
                 break;
-
         }                                                       
         free(msg);
         msg = NULL;
@@ -1530,9 +1485,10 @@ void *bfd_session_work(void *data) {
     pthread_cond_destroy(&bfd_session->bfd_cond);
     
     free(bfd_session);
-    bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d session close success",__FUNCTION__, __LINE__);                        
+    bfd_log(msg_buffer, BFD_MSG_BUFFER_SIZE , "%s:%d bfd session close success",__FUNCTION__, __LINE__);                        
     return NULL;
 }
+
 
 //epoll工作函数, 监听epoll事件并发送消息到响应控制块的消息队列 
 void *bfd_epoll_work(void *data) {
@@ -1544,91 +1500,98 @@ void *bfd_epoll_work(void *data) {
     struct msg_node *msg_priv = NULL;
     struct epoll_callback_data *event_data = NULL;
 
-    // 设置允许线程取消
+    //设置允许线程取消
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
-    // 设置延迟取消
+    //设置延迟取消
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 
-    sleep(5);
     while(1) {
         // 设置线程取消点
         pthread_testcancel(); 
         fds = epoll_wait(efd, g_events, BFD_SESSION_HASH_SIZE, -1);
         for (i = 0; i<fds; i++) {    
+            msg = NULL;
             event_data = (struct epoll_callback_data *)g_events[i].data.ptr;
             if (g_events[i].events & EPOLLIN) { 
                 switch (event_data->fd_type) {
                     //发送消息
-                    case MSG_EVENT_TX_TIMER :                        
+                    case MSG_EVENT_TX_TIMER : 
+                        //bfd_log(epoll_msg, sizeof(epoll_msg), "%s:%d epoll tx event type",__FUNCTION__, __LINE__);                                        
                         ret = read(event_data->fd, &value, sizeof(uint64_t));
-                        //创建消息节点
-                        msg = calloc(1, sizeof(struct msg_node));
-                        if(msg == NULL)
-                            break;
-                        msg->next = NULL;
-                        msg->msg_type = MSG_EVENT_TX_TIMER;
-                        pthread_mutex_lock(&(event_data->bfd_session->bfd_mutex));    
-                        //追加消息节点
-                        if (event_data->bfd_session->msg_head == NULL)
-                            event_data->bfd_session->msg_head = msg;
-                        else {
-                            msg_priv = event_data->bfd_session->msg_head;
-                            while(1) {
-                                if (msg_priv->next != NULL)
-                                    msg_priv = msg_priv->next;
-                                else {
-                                    msg_priv->next = msg;
-                                    break;
-                                }
-                            }
-                        }                           
-                        pthread_mutex_unlock(&(event_data->bfd_session->bfd_mutex));         
-
-                        //通知消费者线程
-                        pthread_cond_signal(&(event_data->bfd_session->bfd_cond));	
-                      //  bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll tx event ",__FUNCTION__, __LINE__);
+                        if(ret != -1){
+                              //创建消息节点
+                              msg = calloc(1, sizeof(struct msg_node));
+                              if(msg == NULL)
+                                  break;
+                              msg->next = NULL;
+                              msg->msg_type = MSG_EVENT_TX_TIMER;
+                              pthread_mutex_lock(&(event_data->bfd_session->bfd_mutex));    
+                              //追加消息节点
+                              if (event_data->bfd_session->msg_head == NULL)
+                                  event_data->bfd_session->msg_head = msg;
+                              else {
+                                  msg_priv = event_data->bfd_session->msg_head;
+                                  while(1) {
+                                      if (msg_priv->next != NULL)
+                                          msg_priv = msg_priv->next;
+                                      else {
+                                          msg_priv->next = msg;
+                                          break;
+                                      }
+                                  }
+                              }                           
+                              pthread_mutex_unlock(&(event_data->bfd_session->bfd_mutex));         
+                            
+                              //通知消费者线程
+                              pthread_cond_signal(&(event_data->bfd_session->bfd_cond));  
+                            //  bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll tx event ",__FUNCTION__, __LINE__);                            
+                        }
 
                         break;
 
                     //超时消息
                     case MSG_EVENT_RX_TIMER :
+                        //bfd_log(epoll_msg, sizeof(epoll_msg), "%s:%d epoll rx event type",__FUNCTION__, __LINE__);                                        
+
                         ret = read(event_data->fd, &value, sizeof(uint64_t));
-
-                        //创建消息节点
-                        msg = calloc(1, sizeof(struct msg_node));
-                        if(msg == NULL)
-                            break;
-                        msg->next = NULL;
-                        msg->msg_type = MSG_EVENT_RX_TIMER;
-                        pthread_mutex_lock(&(event_data->bfd_session->bfd_mutex));
-    
-                        //追加消息节点                     
-                        if (event_data->bfd_session->msg_head == NULL)
-                            event_data->bfd_session->msg_head = msg;
-                        else {
-                            msg_priv = event_data->bfd_session->msg_head;
-                            while(1) {
-                                if (msg_priv->next != NULL)
-                                    msg_priv = msg_priv->next;
-                                else {
-                                    msg_priv->next = msg;
-                                    break;
+                        if(ret != -1){
+                            //创建消息节点
+                            msg = calloc(1, sizeof(struct msg_node));
+                            if(msg == NULL)
+                                break;
+                            msg->next = NULL;
+                            msg->msg_type = MSG_EVENT_RX_TIMER;
+                            pthread_mutex_lock(&(event_data->bfd_session->bfd_mutex));
+                            
+                            //追加消息节点                     
+                            if (event_data->bfd_session->msg_head == NULL)
+                                event_data->bfd_session->msg_head = msg;
+                            else {
+                                msg_priv = event_data->bfd_session->msg_head;
+                                while(1) {
+                                    if (msg_priv->next != NULL)
+                                        msg_priv = msg_priv->next;
+                                    else {
+                                        msg_priv->next = msg;
+                                        break;
+                                    }
                                 }
-                            }
-                        }    
-                        
-                        pthread_mutex_unlock(&(event_data->bfd_session->bfd_mutex));         
-
-                        //通知消费者线程
-                        pthread_cond_signal(&(event_data->bfd_session->bfd_cond));	
-                        //bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll rx event ",__FUNCTION__, __LINE__);
+                            }    
+                            
+                            pthread_mutex_unlock(&(event_data->bfd_session->bfd_mutex));         
+                            
+                            //通知消费者线程
+                            pthread_cond_signal(&(event_data->bfd_session->bfd_cond));  
+                            //bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll rx event ",__FUNCTION__, __LINE__);
+                        }
 
                         break;
 
                     //套接字消息
                     case MSG_EVENT_SOCKET :
-                        //创建消息节点
+                        //bfd_log(epoll_msg, sizeof(epoll_msg), "%s:%d epoll receive event type",__FUNCTION__, __LINE__);                                      
+                        //创建消息节点                        
                         msg = calloc(1, sizeof(struct msg_node));
                         if(msg == NULL)
                             break;
@@ -1655,12 +1618,12 @@ void *bfd_epoll_work(void *data) {
 
                         //通知消费者线程
                         pthread_cond_signal(&(event_data->bfd_session->bfd_cond));	
-                      //  bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll socket event ",__FUNCTION__, __LINE__);
+                        //bfd_log(&epoll_msg[0], sizeof(epoll_msg), "%s:%d epoll socket event ",__FUNCTION__, __LINE__);
 
                         break;
-
-
+                        
                     default:
+                        bfd_log(epoll_msg, sizeof(epoll_msg), "%s:%d unrecognized epoll event type",__FUNCTION__, __LINE__);                    
                         break;                        
                 }
             }            
@@ -1672,25 +1635,24 @@ void *bfd_epoll_work(void *data) {
 }
 
 
-// 设置回调函数
+//设置回调函数
 void bfd_setCallback(CALLBACK_FUNC pfunc) {
-		callbackSendMsg = pfunc;	
+    callbackSendMsg = pfunc;	
 }
 
 
-// 设置回调函数
+//设置回调函数
 void bfd_setLogCallback(LOG_CALLBACK_FUNC pfunc) {
-		log_callback = pfunc;	
+    log_callback = pfunc;	
 }
 
 
-// 发送信息
+//发送信息
 void bfd_notify(char *msgkey, char *msginfo, int msgtype) {
     BFD_RSP rsp;
     strncpy(rsp.msgkey, msgkey, 56);
     strncpy(rsp.msginfo, msginfo, 56);
     rsp.msgtype = msgtype;
- //   rsp.msgservicetype = msgservicetype;
 
     callbackSendMsg(&rsp);
 
@@ -1698,24 +1660,26 @@ void bfd_notify(char *msgkey, char *msginfo, int msgtype) {
 }
 
 
-// 打印日志
+//打印日志
 void bfd_log(char *msg, int size, const char *fmt, ...) {   
     va_list ap;    
-    // 将消息缓存置零
+    //将消息缓存置零
     memset(msg, 0, size);   
     va_start(ap, fmt);
-    // 写入消息
+    //写入消息
     vsnprintf(msg, size, fmt, ap);
     va_end(ap);
-    // 调用go log函数
+
+    //调用go log函数
     log_callback(msg);
     
     return ;
 }
 
 
-// 配置参数打印
+//配置参数打印
 void bfd_session_cfg_dump(struct session_cfg *session_cfg) {
+    return ;
     bfd_log(&msg_buf[0], 512,"%s:%d local_ip_type : %u "
               "local_port :%hu "
               "local_ip : %u:%u:%u:%u "
@@ -1734,6 +1698,7 @@ void bfd_session_cfg_dump(struct session_cfg *session_cfg) {
               session_cfg->req_min_rx_interval, session_cfg->req_min_echo_rx, session_cfg->key);
 }
 
+//删除bfd会话
 void bfd_delete(BFD_CFG *cfg){
 	int ret = 0;
     unsigned int key;
@@ -1774,9 +1739,9 @@ void bfd_delete(BFD_CFG *cfg){
         }
         
         if (session_priv == NULL)
-            master.session_tbl[key] = bfd_session->session_next;
+            master.session_tbl[key] = session_cur->session_next;
         else 
-            session_priv->session_next = bfd_session->session_next; 
+            session_priv->session_next = session_cur->session_next; 
         
         key = hash_key(0, bfd_session->raddr.sin_addr.s_addr);
         neigh_cur = master.neigh_tbl[key];
@@ -1784,10 +1749,12 @@ void bfd_delete(BFD_CFG *cfg){
             neigh_priv = neigh_cur;
             neigh_cur = neigh_cur->neigh_next;
         }
+        
         if (neigh_priv == NULL)
-            master.neigh_tbl[key] = bfd_session->session_next;
+            master.neigh_tbl[key] = neigh_cur->neigh_next;
         else 
-            neigh_priv->neigh_next = bfd_session->session_next;    
+            neigh_priv->neigh_next = neigh_cur->neigh_next;
+            
         pthread_mutex_unlock(&bfd_session_lock);    
 
         //创建消息节点并发送初始会话消息
@@ -1815,11 +1782,12 @@ void bfd_delete(BFD_CFG *cfg){
             pthread_cond_signal(&(bfd_session->bfd_cond));  
         }   
     }
+    
 	return;
 }
 
 
-// 添加bfd配置
+//添加bfd配置
 void bfd_add(BFD_CFG *cfg) {
 	uint32_t src, dst;
 	int ret = 0;
@@ -1837,20 +1805,22 @@ void bfd_add(BFD_CFG *cfg) {
     val.req_min_echo_rx = cfg->reqMinEchoRx;        //默认echo报文时长
     val.local_ip.ip = src;                          //本地IP地址
     val.remote_ip.ip = dst;                         //远端IP地址
-//    val.service_type = cfg->serviceType;
+    //val.service_type = cfg->serviceType;
     strncpy(val.key, cfg->key, 55);                 //key值
     bfd_session_cfg_dump(&val);
 
     ret = bfd_session_add(&val);
-    if ( ret != 0) {
+    #if 0
+    if (ret != 0) {
       //  bfd_notify(val.key, "bfd add session fail", HaBFDSessionCreateFailRsp);
     }
+    #endif
     
     return ;    
 }
 
 
-// bfd 初始化，成功返回0
+//bfd初始化，成功返回0
 int bfd_init(void) {
     int ret;   
 
@@ -1860,11 +1830,11 @@ int bfd_init(void) {
         bfd_log(&msg_buf[0], sizeof(msg_buf), " %s:%d create epoll fail ",__FUNCTION__, __LINE__);
         return -1;
     }
-    bfd_log(&msg_buf[0], sizeof(msg_buf), " %s:%d create epoll success ",__FUNCTION__, __LINE__);    
+    bfd_log(&msg_buf[0], sizeof(msg_buf), " %s:%d create epoll instance success ",__FUNCTION__, __LINE__);    
     
     g_events = (struct epoll_event *)calloc(BFD_SESSION_HASH_SIZE, sizeof(struct epoll_event));
     if(g_events == NULL) {
-        bfd_log(&msg_buf[0], sizeof(msg_buf), " %s:%d calloc fail ",__FUNCTION__, __LINE__);
+        bfd_log(&msg_buf[0], sizeof(msg_buf), " %s:%d epoll event cache calloc fail ",__FUNCTION__, __LINE__);
         close(efd);
         return -1;
     }
@@ -1880,10 +1850,7 @@ int bfd_init(void) {
     }
     bfd_log(&msg_buf[0], sizeof(msg_buf), "%s:%d epoll thread create success ",__FUNCTION__, __LINE__);       
 
-    return 0;
-    
-err:        
-    pthread_join(epoll_thread, NULL);              // 线程取消    
+    return 0;   
     
 err1:
     close(efd);  // 关闭epoll描述符
@@ -1902,10 +1869,10 @@ int bfd_exit() {
     unsigned int disc, addr, key;
     struct msg_node *msg = NULL;
     struct msg_node *msg_priv = NULL;
-    struct session *bfd_session;
-    struct session *session_next;
-    struct session *neigh;
-    struct session *neigh_priv;
+    struct session *bfd_session = NULL;
+    struct session *session_next = NULL;
+    struct session *neigh = NULL;
+    struct session *neigh_priv = NULL;
 
     // 释放bfd会话
     pthread_mutex_lock(&bfd_session_lock);
@@ -1923,6 +1890,7 @@ int bfd_exit() {
                         neigh_priv->neigh_next = neigh->neigh_next;
                     else
                         master.neigh_tbl[key] = neigh->neigh_next;                
+
                     break;                        
                 }
                 else {
@@ -1930,6 +1898,7 @@ int bfd_exit() {
                     neigh = neigh->neigh_next;
                 }
             }
+
             //创建消息节点并发送初始会话消息
             msg = calloc(1, sizeof(struct msg_node));
             if(msg) {
@@ -1951,6 +1920,7 @@ int bfd_exit() {
                         }                
                     }
                 }              
+                
                 pthread_mutex_unlock(&(bfd_session->bfd_mutex));         
                 pthread_cond_signal(&(bfd_session->bfd_cond));  
             }            
@@ -1960,9 +1930,9 @@ int bfd_exit() {
     pthread_mutex_unlock(&bfd_session_lock);
 
     // 通知线程退出    
-    bfd_log(&msg_buf[0], sizeof(msg_buf), "%s:%d pthread cancel epoll_thread ",__FUNCTION__, __LINE__);
     pthread_cancel(epoll_thread);
     pthread_join(epoll_thread, NULL);     
+    bfd_log(&msg_buf[0], sizeof(msg_buf), "%s:%d bfd epoll_thread exit",__FUNCTION__, __LINE__);
 
     // 关闭文件描述
     close(efd);
@@ -1970,6 +1940,7 @@ int bfd_exit() {
         free(g_events);
         g_events = NULL;
     }
+    
     return ret;
 }
 
